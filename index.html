@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>360° Panorama Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #overlay {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.82);
+    color: #fff; font-family: system-ui, sans-serif;
+    z-index: 10; gap: .8rem;
+  }
+  #overlay.hidden { display: none; }
+  #overlay .icon { font-size: clamp(2rem, 8vw, 3.5rem); }
+  #overlay h1 { font-size: clamp(1.3rem, 4vw, 2rem); letter-spacing: .05em; }
+  #overlay p  { font-size: clamp(.85rem, 2.5vw, 1rem); opacity: .7; }
+
+  .btn-row { display: flex; gap: .75rem; flex-wrap: wrap; justify-content: center; margin-top: .4rem; }
+
+  .btn {
+    padding: .6rem 1.4rem; border-radius: 8px; border: none;
+    font-size: clamp(.85rem, 2vw, 1rem); font-weight: 600;
+    cursor: pointer; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: #4ade80; color: #000; }
+
+  #upload-label {
+    display: inline-block; padding: .6rem 1.4rem; border-radius: 8px;
+    border: 1.5px solid rgba(255,255,255,.4);
+    font-size: clamp(.85rem, 2vw, 1rem); font-weight: 600;
+    cursor: pointer; color: #fff; transition: opacity .15s;
+  }
+  #upload-label:hover { opacity: .85; }
+  #file-input { display: none; }
+
+  #filename {
+    font-size: .8rem; opacity: .55; max-width: 320px;
+    text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+    text-align: center;
+  }
+
+  #hint {
+    position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,.5); font-family: system-ui, sans-serif;
+    font-size: .8rem; pointer-events: none; letter-spacing: .04em;
+  }
+
+  #reopen {
+    position: fixed; top: 1rem; right: 1rem;
+    background: rgba(0,0,0,.55); color: #fff;
+    border: 1px solid rgba(255,255,255,.25); border-radius: 8px;
+    padding: .45rem .9rem; font-size: .8rem; cursor: pointer;
+    font-family: system-ui, sans-serif; display: none;
+    transition: background .15s;
+  }
+  #reopen:hover { background: rgba(0,0,0,.8); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="overlay">
+  <div class="icon">🌐</div>
+  <h1>360° Panorama Viewer</h1>
+  <p>Use the built-in panorama or upload your own video</p>
+  <div class="btn-row">
+    <button class="btn btn-primary" id="btn-default">▶ Play default</button>
+    <label id="upload-label" for="file-input">📂 Upload your video</label>
+    <input type="file" id="file-input" accept="video/*">
+  </div>
+  <div id="filename"></div>
+</div>
+
+<button id="reopen">📂 Change video</button>
+<div id="hint">ESC to release mouse · drag to look</div>
+
+<video id="v" src="replicate-prediction-666ff6p6f1rmt0cxqg796vaxq4.mp4"
+       loop playsinline crossorigin="anonymous" style="display:none"></video>
+
+<script>
+const canvas    = document.getElementById('c');
+const overlay   = document.getElementById('overlay');
+const video     = document.getElementById('v');
+const fileInput = document.getElementById('file-input');
+const fnLabel   = document.getElementById('filename');
+const btnDef    = document.getElementById('btn-default');
+const reopen    = document.getElementById('reopen');
+const gl        = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+if (!gl) { overlay.innerHTML = '<p style="color:#f87171">WebGL not supported.</p>'; }
+
+const VS = `
+attribute vec3 aPos; attribute vec2 aUV;
+uniform mat4 uMVP; varying vec2 vUV;
+void main(){ gl_Position = uMVP * vec4(aPos,1.0); vUV = aUV; }`;
+const FS = `
+precision mediump float; varying vec2 vUV; uniform sampler2D uTex;
+void main(){ gl_FragColor = texture2D(uTex, vUV); }`;
+
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, mkShader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog); gl.useProgram(prog);
+
+const aPos = gl.getAttribLocation(prog, 'aPos');
+const aUV  = gl.getAttribLocation(prog, 'aUV');
+const uMVP = gl.getUniformLocation(prog, 'uMVP');
+const uTex = gl.getUniformLocation(prog, 'uTex');
+
+function buildSphere(lat, lon) {
+  const v=[], u=[], idx=[];
+  for (let i=0;i<=lat;i++) {
+    const t=i*Math.PI/lat, st=Math.sin(t), ct=Math.cos(t);
+    for (let j=0;j<=lon;j++) {
+      const p=j*2*Math.PI/lon;
+      v.push(st*Math.cos(p), ct, st*Math.sin(p));
+      u.push(1-j/lon, i/lat);
+    }
+  }
+  for (let i=0;i<lat;i++) for (let j=0;j<lon;j++) {
+    const a=i*(lon+1)+j, b=a+lon+1;
+    idx.push(a,a+1,b,b,a+1,b+1);
+  }
+  return { v:new Float32Array(v), u:new Float32Array(u), i:new Uint16Array(idx) };
+}
+const sph = buildSphere(64, 128);
+const vBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,vBuf); gl.bufferData(gl.ARRAY_BUFFER,sph.v,gl.STATIC_DRAW);
+const uBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,uBuf); gl.bufferData(gl.ARRAY_BUFFER,sph.u,gl.STATIC_DRAW);
+const iBuf=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,iBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,sph.i,gl.STATIC_DRAW);
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+
+let videoReady = false;
+video.addEventListener('canplaythrough', () => { videoReady = true; });
+
+let yaw=0, pitch=0;
+const PLIM=Math.PI/2-.05, SPL=.002, SDR=.004;
+let locked=false, dragging=false;
+
+document.addEventListener('pointerlockchange', () => { locked = document.pointerLockElement===canvas; });
+document.addEventListener('mousemove', e => {
+  if (locked)        { yaw-=e.movementX*SPL; pitch-=e.movementY*SPL; }
+  else if (dragging) { yaw-=e.movementX*SDR; pitch-=e.movementY*SDR; }
+  pitch = Math.max(-PLIM, Math.min(PLIM, pitch));
+});
+canvas.addEventListener('mousedown', () => { dragging=true; });
+document.addEventListener('mouseup',  () => { dragging=false; });
+
+let ltx=0, lty=0;
+canvas.addEventListener('touchstart', e=>{ e.preventDefault(); dragging=true; ltx=e.touches[0].clientX; lty=e.touches[0].clientY; },{passive:false});
+canvas.addEventListener('touchmove',  e=>{ e.preventDefault(); if(!dragging)return; yaw-=(e.touches[0].clientX-ltx)*SDR; pitch-=(e.touches[0].clientY-lty)*SDR; pitch=Math.max(-PLIM,Math.min(PLIM,pitch)); ltx=e.touches[0].clientX; lty=e.touches[0].clientY; },{passive:false});
+canvas.addEventListener('touchend',   () => { dragging=false; });
+
+function startPlayer() {
+  overlay.classList.add('hidden');
+  reopen.style.display = 'block';
+  video.play().catch(()=>{});
+  canvas.requestPointerLock && canvas.requestPointerLock();
+}
+
+btnDef.addEventListener('click', startPlayer);
+
+fileInput.addEventListener('change', () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  fnLabel.textContent = file.name;
+  videoReady = false;
+  video.src = URL.createObjectURL(file);
+  video.load();
+  video.addEventListener('canplaythrough', () => { videoReady = true; }, { once: true });
+  startPlayer();
+});
+
+reopen.addEventListener('click', () => {
+  video.pause();
+  overlay.classList.remove('hidden');
+  reopen.style.display = 'none';
+  document.exitPointerLock && document.exitPointerLock();
+});
+
+const m4=()=>new Float32Array(16);
+function perspective(fov,asp,n,f){const m=m4(),t=1/Math.tan(fov/2);m[0]=t/asp;m[5]=t;m[10]=(f+n)/(n-f);m[11]=-1;m[14]=2*f*n/(n-f);return m;}
+function rotY(a){const c=Math.cos(a),s=Math.sin(a),m=m4();m[0]=c;m[2]=s;m[5]=1;m[8]=-s;m[10]=c;m[15]=1;return m;}
+function rotX(a){const c=Math.cos(a),s=Math.sin(a),m=m4();m[0]=1;m[5]=c;m[6]=-s;m[9]=s;m[10]=c;m[15]=1;return m;}
+function mul(a,b){const m=m4();for(let r=0;r<4;r++)for(let c=0;c<4;c++)for(let k=0;k<4;k++)m[r+c*4]+=a[r+k*4]*b[k+c*4];return m;}
+
+function resize(){ canvas.width=window.innerWidth; canvas.height=window.innerHeight; gl.viewport(0,0,canvas.width,canvas.height); }
+window.addEventListener('resize', resize); resize();
+
+function render() {
+  requestAnimationFrame(render);
+  if (videoReady && !video.paused && !video.ended && video.readyState>=2) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,video);
+  }
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  const mvp = mul(perspective(Math.PI/2.5, canvas.width/canvas.height, .1, 100), mul(rotX(pitch), rotY(yaw)));
+  gl.uniformMatrix4fv(uMVP, false, mvp); gl.uniform1i(uTex, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vBuf); gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, uBuf); gl.enableVertexAttribArray(aUV);  gl.vertexAttribPointer(aUV,2,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, iBuf);
+  gl.drawElements(gl.TRIANGLES, sph.i.length, gl.UNSIGNED_SHORT, 0);
+}
+render();
+</script>
+</body>
+</html>
